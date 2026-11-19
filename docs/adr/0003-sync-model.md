@@ -1,6 +1,6 @@
 # ADR-0003: Server change log with cursors and base-revision conflict detection
 
-- **Status:** Accepted
+- **Status:** Accepted (conflict detection amended by [ADR-0006](0006-separate-content-and-location-revisions.md))
 - **Date:** 2026-11-19
 - **Research:** [Spike 01](../research/01-sync-model.md) (#1)
 
