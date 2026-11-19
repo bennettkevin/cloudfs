@@ -1,6 +1,6 @@
 # CloudFS Design Doc
 
-- **Version:** 0.3 (draft, Sprint 0)
+- **Version:** 0.4 (draft, Sprint 0)
 - **Last reviewed:** 2026-11-19
 
 This is a living document. It's updated at each sprint review to match what's actually decided and built. Individual decisions and their reasoning live in [ADRs](adr/), and research findings in [research/](research/).
@@ -26,8 +26,9 @@ Secondary goal: CloudFS is a learning and portfolio project for cloud architectu
 4. **No silent data loss.** Conflicting edits keep both versions.
 5. Previous file versions are retained for a configurable period.
 6. A small change to a large file uploads only the changed part.
-7. The same codebase runs locally (MinIO, Postgres in Compose) and in AWS (S3, RDS, ECS), switched by configuration.
+7. The same codebase runs locally (an S3-compatible object store and Postgres in Compose) and in AWS (S3, RDS, ECS), switched by configuration. The local object store is pending spike 10, since MinIO's community edition is no longer maintained.
 8. AWS infrastructure is fully reproducible from Terraform and fully removable with `terraform destroy`.
+9. File content is end-to-end encrypted: the server never holds plaintext content or keys ([ADR-0007](adr/0007-end-to-end-encryption.md)).
 
 ## 4. Non-goals (v1)
 
@@ -62,8 +63,11 @@ Each one maps to a research spike ([index](research/README.md)).
 
 - ~~Sync model: server change log + cursor vs version vectors (spike 01)~~ Decided: [ADR-0003](adr/0003-sync-model.md), [ADR-0004](adr/0004-stable-file-ids.md)
 - ~~Conflict resolution behaviour (spike 02)~~ Decided: [ADR-0005](adr/0005-conflict-resolution.md), [ADR-0006](adr/0006-separate-content-and-location-revisions.md)
-- End-to-end encryption, yes or no (spike 03). This is decided early because it constrains chunking and server-side processing.
-- Chunking strategy and chunk size (spike 04)
+- ~~End-to-end encryption, yes or no (spike 03)~~ Decided: [ADR-0007](adr/0007-end-to-end-encryption.md) (E2E in v1), [ADR-0008](adr/0008-at-rest-encryption-aws.md) (AWS at-rest defaults)
+- File/folder name encryption and blind index for unique names (spike 11)
+- Key hierarchy, passphrase/recovery key, new-device onboarding (designed in phase 1 encryption work)
+- Local S3-compatible storage to replace MinIO (spike 10)
+- Chunking strategy, chunk size, keyed chunk ID scheme (spike 04)
 - Delete/rename semantics and retention (spike 05)
 - Windows support timing (spike 06 informs)
 - Device authentication and revocation (spike 08)
@@ -133,7 +137,25 @@ Partially decided ([ADR-0003](adr/0003-sync-model.md), [ADR-0005](adr/0005-confl
 
 ## 11. Security
 
-*Pending spikes 03, 08.* Baseline commitments: TLS everywhere, least-privilege IAM per service, no long-lived cloud credentials in CI (OIDC), secrets only in a secret store or gitignored `.env`.
+Baseline commitments: TLS everywhere, least-privilege IAM per service, no long-lived cloud credentials in CI (OIDC), secrets only in a secret store or gitignored `.env`.
+
+**Encryption layers**
+
+| Layer | Choice | Protects against |
+|---|---|---|
+| In transit | TLS (phase 4 adds WireGuard) | Network eavesdropping and tampering |
+| End-to-end | File content encrypted on the client before upload ([ADR-0007](adr/0007-end-to-end-encryption.md)) | Compromised server, cloud provider, leaked bucket or database |
+| At rest, AWS | SSE-S3 default; RDS encrypted at creation with the AWS-managed key ([ADR-0008](adr/0008-at-rest-encryption-aws.md)) | Stolen disks; defence in depth |
+| At rest, self-hosted | Disk encryption recommended in the self-hosting docs | Stolen or disposed machine |
+
+**End-to-end constraints**
+- No server-side workers read file content.
+- Chunk IDs are a keyed hash, so the bucket can't be used to confirm a known file is stored (scheme: spike 04).
+- Chunks are encrypted after chunking and carry a versioned header (format version, scheme, key ID).
+- Losing the key loses the data, so onboarding must include a recovery key.
+- Device authentication (spike 08) is separate from encryption keys. Revoking a login doesn't revoke keys a device already has.
+
+*Pending:* name encryption (spike 11), key hierarchy and onboarding (phase 1), device auth (spike 08).
 
 ## 12. Infrastructure
 
@@ -142,6 +164,7 @@ Partially decided ([ADR-0003](adr/0003-sync-model.md), [ADR-0005](adr/0005-confl
 Operational settings decided so far:
 - **Change log retention:** 90 days, configurable ([ADR-0003](adr/0003-sync-model.md)).
 - **Database restore:** regenerate `log_meta.epoch` as part of the restore runbook, and log the event clearly.
+- **At-rest encryption (AWS):** S3 default SSE-S3; RDS encryption enabled at creation (can't be added later). Upgrade path to a customer-managed KMS key is in [ADR-0008](adr/0008-at-rest-encryption-aws.md).
 
 ## 13. Observability
 
@@ -152,13 +175,14 @@ Operational settings decided so far:
 | Phase | Epic | Outcome |
 |---|---|---|
 | 0 | Discovery | Design doc v1.0, ADRs for one-way-door decisions, Sprint 1 backlog |
-| 1 | Local MVP | Two-way sync across devices against Compose stack |
+| 1 | Local MVP | Two-way, end-to-end encrypted sync across devices against the Compose stack |
 | 2 | AWS + Terraform | Same system deployed to AWS via IaC and CI with OIDC |
 | 3 | Operate | Metrics, autoscaling, load test, failure write-up, cost report |
 | 4 | Private network (stretch) | API reachable only through a self-run WireGuard gateway |
 
 ## Changelog
 
+- **0.4** (2026-11-19): Spike 03 decided. End-to-end encryption in v1 (ADR-0007) and free at-rest defaults on AWS with a KMS upgrade path (ADR-0008); §11 Security filled in; goal 9 added; goal 7 notes the MinIO replacement (spike 10); new open questions for spikes 10 and 11.
 - **0.3** (2026-11-19): Spike 02 decided. Conflict resolution (ADR-0005) and separate content/location revisions (ADR-0006, amends ADR-0003); §9 and §10 updated.
 - **0.2** (2026-11-19): Spike 01 decided. Sync model (ADR-0003) and stable file IDs (ADR-0004); first cut of §9 Data model and §10 Sync protocol; log retention and restore settings in §12.
 - **0.1** (2026-11-19): Vision, scope, goals, constraints, and open questions. Architecture sections stubbed.
