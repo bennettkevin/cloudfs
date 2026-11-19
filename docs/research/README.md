@@ -1,0 +1,19 @@
+# Research spikes
+
+Each spike is time-boxed, tracked as a GitHub issue, and ends with a findings file here (`NN-topic.md`) plus an ADR if it produced a decision.
+
+## Sprint 0 spikes
+
+Ordered roughly by how much they constrain everything else.
+
+| # | Spike | Question to answer | Feeds |
+|---|---|---|---|
+| 01 | Sync model | Server change log + per-client cursor, or per-file version vectors? | Data model, protocol |
+| 02 | Conflict resolution | What happens when two devices edit the same file offline? | Protocol, client |
+| 03 | Encryption | Server-side at rest only, or client-side end-to-end? (E2E breaks server-side dedup/processing) | Chunking, workers |
+| 04 | Chunking | Fixed-size vs content-defined (FastCDC); chunk size; hash function | Storage layout |
+| 05 | Deletes and renames | Tombstones, move detection, how long deletes are retained | Data model |
+| 06 | File watching | FSEvents/inotify quirks, atomic-save editors, dropped events, rescans | Client |
+| 07 | Uploads | S3/MinIO multipart presigned uploads, limits, MinIO vs S3 event parity | Protocol, infra |
+| 08 | Device auth | How a headless daemon authenticates and how devices are revoked | API |
+| 09 | AWS cost model | Idle cost of NAT gateway, RDS, ALB, Fargate; what to design around | Phase 2 infra |
