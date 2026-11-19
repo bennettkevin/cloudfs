@@ -8,7 +8,7 @@ Ordered roughly by how much they constrain everything else.
 
 | # | Spike | Question to answer | Feeds |
 |---|---|---|---|
-| 01 | Sync model | Server change log + per-client cursor, or per-file version vectors? | Data model, protocol |
+| 01 | Sync model ([findings](01-sync-model.md), decided) | Server change log + per-client cursor, or per-file version vectors? | Data model, protocol |
 | 02 | Conflict resolution | What happens when two devices edit the same file offline? | Protocol, client |
 | 03 | Encryption | Server-side at rest only, or client-side end-to-end? (E2E breaks server-side dedup/processing) | Chunking, workers |
 | 04 | Chunking | Fixed-size vs content-defined (FastCDC); chunk size; hash function | Storage layout |
