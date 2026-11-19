@@ -54,7 +54,7 @@ Phase-level checks that define "done". Numbers marked TBD get set once spikes gi
 - Solo, part-time developer working in 2-week sprints. Size work for school weeks, not for best-case weeks.
 - Go is new to the developer ([ADR-0001](adr/0001-use-go.md)). Early sprints include learning time.
 - Minimal AWS spend: use the free tier where possible, set a budget alarm before first deploy, and tear down when idle.
-- Open source; license TBD.
+- Open source under the MIT License.
 
 ## 7. Open questions
 
