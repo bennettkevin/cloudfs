@@ -1,6 +1,6 @@
 # CloudFS Design Doc
 
-- **Version:** 0.1 (draft, Sprint 0)
+- **Version:** 0.2 (draft, Sprint 0)
 - **Last reviewed:** 2026-11-19
 
 This is a living document. It's updated at each sprint review to match what's actually decided and built. Individual decisions and their reasoning live in [ADRs](adr/), and research findings in [research/](research/).
@@ -60,7 +60,7 @@ Phase-level checks that define "done". Numbers marked TBD get set once spikes gi
 
 Each one maps to a research spike ([index](research/README.md)).
 
-- Sync model: server change log + cursor vs version vectors (spike 01)
+- ~~Sync model: server change log + cursor vs version vectors (spike 01)~~ Decided: [ADR-0003](adr/0003-sync-model.md), [ADR-0004](adr/0004-stable-file-ids.md)
 - Conflict resolution behaviour (spike 02)
 - End-to-end encryption, yes or no (spike 03). This is decided early because it constrains chunking and server-side processing.
 - Chunking strategy and chunk size (spike 04)
@@ -88,11 +88,38 @@ API ──► change notifications ──► other clients pull changes
 
 ## 9. Data model
 
-*Pending spikes 01, 04, 05.*
+Partially decided. Files are identified by stable ID ([ADR-0004](adr/0004-stable-file-ids.md)); changes are tracked in a server log ([ADR-0003](adr/0003-sync-model.md)). Content representation is pending spike 04, delete retention pending spike 05.
+
+**Server (Postgres)**
+
+| Table | Key columns | Notes |
+|---|---|---|
+| `nodes` | `id` (stable, server-assigned), `parent_id`, `name`, `kind` (file/folder), `revision`, `deleted` | Path is derived from `parent_id` + `name`. Unique live `(parent_id, name)`. Content reference (chunk list) pending spike 04. |
+| `changes` | `seq` (monotonic), `node_id`, `revision`, `op` (create/modify/move/delete), `created_at` | Append-only. Writes serialized so `seq` becomes visible in order. Pruned after the retention window. |
+| `log_meta` | `epoch` (random ID) | Regenerated when the database is restored from backup. |
+
+**Client (local store, per device)**
+
+- Server `epoch` and `cursor` (last applied `seq`).
+- Per node: `id`, local path, synced `revision`, content hash at last sync. This is the synced baseline used to classify local vs remote changes.
 
 ## 10. Sync protocol
 
-*Pending spikes 01, 02, 07.*
+Partially decided ([ADR-0003](adr/0003-sync-model.md)). Upload mechanics pending spike 07, conflict resolution pending spike 02.
+
+**Pulling remote changes**
+1. Device sends `epoch` + `cursor`; server returns changes with `seq > cursor` and a new cursor.
+2. Device applies them against its baseline and saves the new cursor.
+3. A long-poll/WebSocket signal tells online devices to pull when new changes land.
+
+**Committing a local change**
+1. Device sends the node ID, the change, and the **base revision** it edited from.
+2. In one transaction the server checks the base revision against the current one. On a match it bumps the revision and appends to `changes`.
+3. On a mismatch the server rejects with a conflict response. Client behaviour after that is spike 02; overwriting is not an option (goal 4).
+
+**Full reconcile** (compare local files, baseline, and a full server listing) happens when:
+- the cursor is older than the log retention window (**cursor too old**), or
+- the server's `epoch` differs from the device's (**server restored**). Files deleted between backup and restore may reappear, an accepted trade-off.
 
 ## 11. Security
 
@@ -101,6 +128,10 @@ API ──► change notifications ──► other clients pull changes
 ## 12. Infrastructure
 
 *Pending spike 09.* Phase 1 local (Compose), phase 2 AWS (Terraform).
+
+Operational settings decided so far:
+- **Change log retention:** 90 days, configurable ([ADR-0003](adr/0003-sync-model.md)).
+- **Database restore:** regenerate `log_meta.epoch` as part of the restore runbook, and log the event clearly.
 
 ## 13. Observability
 
@@ -118,4 +149,5 @@ API ──► change notifications ──► other clients pull changes
 
 ## Changelog
 
+- **0.2** (2026-11-19): Spike 01 decided. Sync model (ADR-0003) and stable file IDs (ADR-0004); first cut of §9 Data model and §10 Sync protocol; log retention and restore settings in §12.
 - **0.1** (2026-11-19): Vision, scope, goals, constraints, and open questions. Architecture sections stubbed.
