@@ -25,10 +25,11 @@ CloudFS does **not** rely on conditional writes, bucket event notifications, buc
 **3. Default local store: Garage, single-node** (`--single-node`, v2.3+), with the version **pinned** in the Compose file. Upgrades are deliberate changes that run the test suite.
 
 **4. Testing:**
-- Integration tests run against the same pinned Garage, started with `testcontainers-go`.
-- A shared object-store contract test suite covers the operations in point 1.
-- Phase 2 adds a scheduled run of the same suite against real AWS S3.
-- During initial development, **Garage is the only store tested.**
+- **Unit tests** use [`gofakes3`](https://github.com/johannesboyne/gofakes3) (MIT, actively maintained), an in-process fake S3 server. Tests exercise the real `ObjectStore` code and `aws-sdk-go-v2` calls without Docker, so they're fast and run anywhere.
+- **Integration tests** run against the same pinned Garage, started with `testcontainers-go`.
+- A shared object-store **contract test suite** covers the operations in point 1 and runs against Garage.
+- Phase 2 adds a scheduled run of the same contract suite against real AWS S3.
+- During initial development, **Garage is the only real store tested.** gofakes3 is a test double, not a supported store. Behaviour that depends on store fidelity (SigV4 signature checks, presigned URLs, signed checksum enforcement) is asserted in the Garage integration and contract tests, not in unit tests against the fake.
 
 **Untested alternatives** (documented for self-hosters; expected to work if they implement the contract above, but not tested by CloudFS):
 - **SeaweedFS** — Apache-2.0, very active, widest S3 coverage; a larger system to run.
@@ -51,4 +52,5 @@ Any of these can be promoted to "tested" later by adding it to the contract test
 - Garage lacks conditional writes, bucket notifications and versioning **by design**, so the contract rule above is enforced in practice: code that needs them fails local tests.
 - Garage is AGPL-3.0. Running it unmodified as a separate container doesn't change CloudFS's MIT license (standard interpretation, not legal advice).
 - Garage supports the SDK's newer checksum headers (checksum support since v1.0; CRC64NVME and `x-amz-checksum-type` in v2.0; fixes in v2.3 and v2.5). Remaining checksum edge cases are covered by `WhenRequired`, the version pin and the contract tests.
+- Three test layers (gofakes3 unit, Garage integration/contract, AWS S3 scheduled) let most tests run quickly without Docker while store-specific behaviour is still checked against a real store.
 - Spike 07 must verify presigned PUT behaviour with a signed `x-amz-checksum-sha256` against both Garage and AWS S3.

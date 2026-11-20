@@ -178,7 +178,11 @@ Baseline commitments: TLS everywhere, least-privilege IAM per service, no long-l
 - CloudFS uses only a minimal S3 contract: Put/Get/Head/Delete, ListObjectsV2, presigned PUT/GET with a signed `x-amz-checksum-sha256`, path-style addressing, range GET. No conditional writes, bucket notifications, versioning or server-side encryption.
 - Access goes through a Go `ObjectStore` interface over `aws-sdk-go-v2`. Switching stores is configuration only: endpoint, region, `UsePathStyle`, and checksum mode (`WhenRequired` by default, which works on AWS S3 and Garage alike).
 - **Local default:** Garage, single-node, version pinned in the Compose file.
-- **Tested stores:** Garage only during initial development (testcontainers-go + a shared contract test suite); AWS S3 added in phase 2 via a scheduled run of the same suite.
+- **Testing layers:**
+  - **Unit tests:** gofakes3, an in-process fake S3 server (no Docker).
+  - **Integration and contract tests:** Garage via testcontainers-go. Garage is the only real store tested during initial development.
+  - **Phase 2:** a scheduled run of the contract suite against AWS S3.
+  - Signature, presigned-URL and checksum enforcement are asserted against Garage, not the fake.
 - **Untested alternatives** for self-hosters: SeaweedFS, Versity Gateway (versitygw), PGSTY Silo. Expected to work if they implement the contract, but not tested by CloudFS.
 
 Operational settings decided so far:
@@ -202,7 +206,7 @@ Operational settings decided so far:
 
 ## Changelog
 
-- **0.6** (2026-11-20): Spike 10 decided. Minimal S3 contract with Garage as the pinned local store and the only tested store for now (ADR-0011); goal 7 and the architecture sketch name Garage instead of MinIO; §12 gains the object storage section with untested alternatives.
+- **0.6** (2026-11-20): Spike 10 decided. Minimal S3 contract with Garage as the pinned local store and the only real store tested for now, plus gofakes3 for unit tests (ADR-0011); goal 7 and the architecture sketch name Garage instead of MinIO; §12 gains the object storage section with untested alternatives.
 - **0.5** (2026-11-20): Spike 04 decided. Keyed FastCDC + HMAC-SHA256 chunk IDs (ADR-0009); one padded object per chunk with a location index and encrypted manifests (ADR-0010); §9 gains `revisions`, `revision_refs`, `chunks` and the object format; §10 gains the upload outline.
 - **0.4** (2026-11-19): Spike 03 decided. End-to-end encryption in v1 (ADR-0007) and free at-rest defaults on AWS with a KMS upgrade path (ADR-0008); §11 Security filled in; goal 9 added; goal 7 notes the MinIO replacement (spike 10); new open questions for spikes 10 and 11.
 - **0.3** (2026-11-19): Spike 02 decided. Conflict resolution (ADR-0005) and separate content/location revisions (ADR-0006, amends ADR-0003); §9 and §10 updated.
