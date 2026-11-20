@@ -1,7 +1,7 @@
 # Spike 10: Local S3-compatible object storage (MinIO replacement)
 
 - **Issue:** #13
-- **Status:** Decided. See [ADR-0011](../adr/0011-local-object-storage.md): minimal S3 contract, Garage single-node as the pinned local default and the only store tested during initial development. SeaweedFS, versitygw and Silo are documented as **untested** alternatives. `gofakes3` (section 7, point 3) is adopted for unit tests as a test double; it is not a supported store. gofakes3 status (MIT, active, last commit 2026-11-12) checked on 2026-11-20. MinIO image, LocalStack archive, Garage releases (incl. checksum changes), SeaweedFS and Silo status re-checked on 2026-11-20.
+- **Status:** Decided. See [ADR-0011](../adr/0011-local-object-storage.md): minimal S3 contract, Garage single-node as the pinned local default and the only real store tested during initial development. SeaweedFS, versitygw and Silo are documented as **untested** alternatives. `gofakes3` (section 7, point 3) is adopted for unit tests as a test double; it is not a supported store. gofakes3 status (MIT, active, last commit 2026-11-12) checked on 2026-11-20. MinIO image, LocalStack archive, Garage releases (incl. checksum changes), SeaweedFS and Silo status re-checked on 2026-11-20.
 - **Question:** MinIO's community edition is no longer maintained. What S3-compatible store does CloudFS run locally (dev Compose stack and self-hosters), and what do automated tests run against, so the same Go code works locally and on AWS S3 (design goal 7)?
 
 All repo and image facts below were checked on 2026-11-20 (GitHub API, Docker Hub API, project docs) unless marked *unverified*.
