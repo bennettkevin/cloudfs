@@ -1,6 +1,6 @@
 # CloudFS Design Doc
 
-- **Version:** 0.4 (draft, Sprint 0)
+- **Version:** 0.5 (draft, Sprint 0)
 - **Last reviewed:** 2026-11-19
 
 This is a living document. It's updated at each sprint review to match what's actually decided and built. Individual decisions and their reasoning live in [ADRs](adr/), and research findings in [research/](research/).
@@ -67,7 +67,7 @@ Each one maps to a research spike ([index](research/README.md)).
 - File/folder name encryption and blind index for unique names (spike 11)
 - Key hierarchy, passphrase/recovery key, new-device onboarding (designed in phase 1 encryption work)
 - Local S3-compatible storage to replace MinIO (spike 10)
-- Chunking strategy, chunk size, keyed chunk ID scheme (spike 04)
+- ~~Chunking strategy, chunk size, keyed chunk ID scheme (spike 04)~~ Decided: [ADR-0009](adr/0009-chunking-and-chunk-ids.md), [ADR-0010](adr/0010-chunk-storage-and-manifests.md)
 - Delete/rename semantics and retention (spike 05)
 - Windows support timing (spike 06 informs)
 - Device authentication and revocation (spike 08)
@@ -92,24 +92,37 @@ API ──► change notifications ──► other clients pull changes
 
 ## 9. Data model
 
-Partially decided. Files are identified by stable ID ([ADR-0004](adr/0004-stable-file-ids.md)); changes are tracked in a server log ([ADR-0003](adr/0003-sync-model.md)); content and location are versioned separately ([ADR-0006](adr/0006-separate-content-and-location-revisions.md)). Content representation is pending spike 04, delete retention pending spike 05.
+Partially decided. Files are identified by stable ID ([ADR-0004](adr/0004-stable-file-ids.md)); changes are tracked in a server log ([ADR-0003](adr/0003-sync-model.md)); content and location are versioned separately ([ADR-0006](adr/0006-separate-content-and-location-revisions.md)); content is stored as keyed chunks with encrypted manifests ([ADR-0009](adr/0009-chunking-and-chunk-ids.md), [ADR-0010](adr/0010-chunk-storage-and-manifests.md)). Delete retention pending spike 05.
 
 **Server (Postgres)**
 
 | Table | Key columns | Notes |
 |---|---|---|
-| `nodes` | `id` (stable, server-assigned), `parent_id`, `name`, `kind` (file/folder), `content_rev`, `location_rev`, `deleted` | Path is derived from `parent_id` + `name`. Live names unique per folder, **case-insensitive**. No folder cycles. Content reference (chunk list) pending spike 04. |
+| `nodes` | `id` (stable, server-assigned), `parent_id`, `name`, `kind` (file/folder), `content_rev`, `location_rev`, `deleted` | Path is derived from `parent_id` + `name`. Live names unique per folder, **case-insensitive**. No folder cycles. Current content is the `revisions` row matching `content_rev`. |
+| `revisions` | `node_id`, `content_rev`, `manifest` (encrypted blob), `created_at` | One row per retained content revision (version history, goal 5). The manifest (ordered chunk IDs and plaintext lengths) is readable only by clients. |
+| `revision_refs` | `node_id`, `content_rev`, `chunk_id` | Unordered set of chunks a revision uses. Server-visible, for refcounting and GC. |
+| `chunks` | `chunk_id` (keyed HMAC-SHA256), `id_scheme`, `object_key`, `offset`, `length`, `created_at`, `unreferenced_since` | Location index: in v1 each chunk is its own padded object at offset 0, ready for pack objects later. GC deletes chunks unreferenced longer than the grace period (24 h, configurable). |
 | `changes` | `seq` (monotonic), `node_id`, `content_rev`, `location_rev`, `op` (create/modify/move/delete), `created_at` | Append-only. Writes serialized so `seq` becomes visible in order. Pruned after the retention window. |
 | `log_meta` | `epoch` (random ID) | Regenerated when the database is restored from backup. |
 
 **Client (local store, per device)**
 
 - Server `epoch` and `cursor` (last applied `seq`).
-- Per node: `id`, local path, synced `content_rev` and `location_rev`, content hash at last sync. This is the synced baseline used to classify local vs remote changes.
+- Per node: `id`, local path, synced `content_rev` and `location_rev`, content hash at last sync, size + mtime at last sync. This is the synced baseline used to classify local vs remote changes. The content hash is a keyed hash over the file's ordered chunk IDs.
+
+**Object store**
+
+- One object per chunk: versioned header (format version, scheme, key ID), padded ciphertext, AEAD tag. The chunk ID is bound into the AEAD associated data.
 
 ## 10. Sync protocol
 
-Partially decided ([ADR-0003](adr/0003-sync-model.md), [ADR-0005](adr/0005-conflict-resolution.md), [ADR-0006](adr/0006-separate-content-and-location-revisions.md)). Upload mechanics pending spike 07.
+Partially decided ([ADR-0003](adr/0003-sync-model.md), [ADR-0005](adr/0005-conflict-resolution.md), [ADR-0006](adr/0006-separate-content-and-location-revisions.md), [ADR-0010](adr/0010-chunk-storage-and-manifests.md)). Exact upload API and SDK behaviour pending spike 07.
+
+**Uploading content** (outline)
+1. Client chunks the file with keyed FastCDC (256 KiB / 1 MiB / 4 MiB) and computes keyed chunk IDs ([ADR-0009](adr/0009-chunking-and-chunk-ids.md)).
+2. Client asks the server which chunk IDs it doesn't already have (one batch request).
+3. For each missing chunk: encrypt, pad, compute the ciphertext SHA-256, request a presigned PUT with that checksum signed in, upload directly to the object store.
+4. Client commits the new content revision: base `content_rev`, encrypted manifest, and the unordered chunk reference set.
 
 **Pulling remote changes**
 1. Device sends `epoch` + `cursor`; server returns changes with `seq > cursor` and a new cursor.
@@ -150,7 +163,7 @@ Baseline commitments: TLS everywhere, least-privilege IAM per service, no long-l
 
 **End-to-end constraints**
 - No server-side workers read file content.
-- Chunk IDs are a keyed hash, so the bucket can't be used to confirm a known file is stored (scheme: spike 04).
+- Chunk IDs are a keyed hash, so the bucket can't be used to confirm a known file is stored (HMAC-SHA256, [ADR-0009](adr/0009-chunking-and-chunk-ids.md)). Exact chunk sizes are hidden by padding; pack objects later close the remaining size leak ([ADR-0010](adr/0010-chunk-storage-and-manifests.md)).
 - Chunks are encrypted after chunking and carry a versioned header (format version, scheme, key ID).
 - Losing the key loses the data, so onboarding must include a recovery key.
 - Device authentication (spike 08) is separate from encryption keys. Revoking a login doesn't revoke keys a device already has.
@@ -182,6 +195,7 @@ Operational settings decided so far:
 
 ## Changelog
 
+- **0.5** (2026-11-20): Spike 04 decided. Keyed FastCDC + HMAC-SHA256 chunk IDs (ADR-0009); one padded object per chunk with a location index and encrypted manifests (ADR-0010); §9 gains `revisions`, `revision_refs`, `chunks` and the object format; §10 gains the upload outline.
 - **0.4** (2026-11-19): Spike 03 decided. End-to-end encryption in v1 (ADR-0007) and free at-rest defaults on AWS with a KMS upgrade path (ADR-0008); §11 Security filled in; goal 9 added; goal 7 notes the MinIO replacement (spike 10); new open questions for spikes 10 and 11.
 - **0.3** (2026-11-19): Spike 02 decided. Conflict resolution (ADR-0005) and separate content/location revisions (ADR-0006, amends ADR-0003); §9 and §10 updated.
 - **0.2** (2026-11-19): Spike 01 decided. Sync model (ADR-0003) and stable file IDs (ADR-0004); first cut of §9 Data model and §10 Sync protocol; log retention and restore settings in §12.
