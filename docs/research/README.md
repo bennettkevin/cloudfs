@@ -12,7 +12,7 @@ Ordered roughly by how much they constrain everything else.
 | 02 | Conflict resolution ([findings](02-conflicts.md), decided) | What happens when two devices edit the same file offline? | Protocol, client |
 | 03 | Encryption ([findings](03-encryption.md), decided) | Server-side at rest only, or client-side end-to-end? (E2E breaks server-side dedup/processing) | Chunking, workers |
 | 04 | Chunking ([findings](04-chunking.md), decided) | Fixed-size vs content-defined (FastCDC); chunk size; hash function | Storage layout |
-| 05 | Deletes and renames | Tombstones, move detection, how long deletes are retained | Data model |
+| 05 | Deletes and renames ([findings](05-deletes-renames.md), decided) | Tombstones, move detection, how long deletes are retained | Data model |
 | 06 | File watching | FSEvents/inotify quirks, atomic-save editors, dropped events, rescans | Client |
 | 07 | Uploads | S3/MinIO multipart presigned uploads, limits, MinIO vs S3 event parity | Protocol, infra |
 | 08 | Device auth | How a headless daemon authenticates and how devices are revoked | API |
