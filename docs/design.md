@@ -1,6 +1,6 @@
 # CloudFS Design Doc
 
-- **Version:** 0.7 (draft, Sprint 0)
+- **Version:** 0.8 (draft, Sprint 0)
 - **Last reviewed:** 2026-11-19
 
 This is a living document. It's updated at each sprint review to match what's actually decided and built. Individual decisions and their reasoning live in [ADRs](adr/), and research findings in [research/](research/).
@@ -70,7 +70,7 @@ Each one maps to a research spike ([index](research/README.md)).
 - ~~Chunking strategy, chunk size, keyed chunk ID scheme (spike 04)~~ Decided: [ADR-0009](adr/0009-chunking-and-chunk-ids.md), [ADR-0010](adr/0010-chunk-storage-and-manifests.md)
 - ~~Delete/rename semantics and retention (spike 05)~~ Decided: [ADR-0012](adr/0012-deletes-tombstones-and-trash.md), [ADR-0013](adr/0013-move-detection-and-mass-delete-guard.md)
 - Version retention period for live files (goal 5), independent of the 30-day trash
-- Windows support timing (spike 06 informs)
+- Windows support timing. Spike 06 ([ADR-0014](adr/0014-local-change-detection.md)) puts the watcher behind an interface so a ReadDirectoryChangesW backend can be added later; timing still open.
 - Device authentication and revocation (spike 08)
 - AWS monthly budget target (spike 09)
 
@@ -131,6 +131,20 @@ Partially decided ([ADR-0003](adr/0003-sync-model.md), [ADR-0005](adr/0005-confl
 1. Device sends `epoch` + `cursor`; server returns changes with `seq > cursor` and a new cursor.
 2. Device applies them against its baseline and saves the new cursor.
 3. A long-poll/WebSocket signal tells online devices to pull when new changes land.
+
+**Applying a remote change locally** ([ADR-0014](adr/0014-local-change-detection.md))
+1. Download and decrypt to `<root>/.cloudfs/tmp/` (same filesystem), `fsync`.
+2. Re-check the local target against the baseline. If it changed, don't overwrite: it's a conflict (ADR-0005).
+3. Atomic rename over the target, `fsync` the directory.
+4. Update the baseline. This also suppresses the watcher echo, since disk now matches the baseline.
+
+**Detecting local changes** ([ADR-0014](adr/0014-local-change-detection.md))
+- OS events are hints, scans are the truth. Watcher: `rjeczalik/notify` behind our own interface (FSEvents via cgo on macOS, inotify on Linux).
+- Full scan at startup; targeted scan after a ~10 s quiet period (deletes held ~60 s more for move pairing); full rescan hourly with jitter and immediately on event overflow.
+- Scans compare size, mtime and inode with the baseline; only differing files are re-read and re-chunked.
+- A rename onto a path already in the baseline (editor atomic save) is a modify.
+- Names go to the server in Unicode NFC; local spelling is kept on disk.
+- Skipped and logged in v1: symlinks, FIFOs, sockets, device files. Ignored: `.cloudfs/` and built-in OS/editor junk patterns. A user `.cloudfsignore` is deferred.
 
 **Committing a local change**
 1. Device sends the node ID, the change, and the **base revision** for the group it changes: `content_rev` for edits and deletes, `location_rev` for renames and moves.
@@ -220,6 +234,7 @@ Operational settings decided so far:
 
 ## Changelog
 
+- **0.8** (2026-11-23): Spike 06 decided. Local change detection with OS events as hints and scans as the truth, `rjeczalik/notify` watcher, safe apply of remote changes, NFC names, v1 skip and ignore rules (ADR-0014); §10 gains apply and detection subsections.
 - **0.7** (2026-11-23): Spike 05 decided. Tombstone stubs kept forever, 30-day trash with same-ID restore, single-change folder deletes and moves (ADR-0012); client move detection and mass-delete guard (ADR-0013); §9, §10, §12 updated; version retention added as an open question.
 - **0.6** (2026-11-20): Spike 10 decided. Minimal S3 contract with Garage as the pinned local store and the only real store tested for now, plus gofakes3 for unit tests (ADR-0011); goal 7 and the architecture sketch name Garage instead of MinIO; §12 gains the object storage section with untested alternatives.
 - **0.5** (2026-11-20): Spike 04 decided. Keyed FastCDC + HMAC-SHA256 chunk IDs (ADR-0009); one padded object per chunk with a location index and encrypted manifests (ADR-0010); §9 gains `revisions`, `revision_refs`, `chunks` and the object format; §10 gains the upload outline.
