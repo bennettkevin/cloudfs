@@ -1,6 +1,6 @@
 # CloudFS Design Doc
 
-- **Version:** 0.6 (draft, Sprint 0)
+- **Version:** 0.7 (draft, Sprint 0)
 - **Last reviewed:** 2026-11-19
 
 This is a living document. It's updated at each sprint review to match what's actually decided and built. Individual decisions and their reasoning live in [ADRs](adr/), and research findings in [research/](research/).
@@ -68,7 +68,8 @@ Each one maps to a research spike ([index](research/README.md)).
 - Key hierarchy, passphrase/recovery key, new-device onboarding (designed in phase 1 encryption work)
 - ~~Local S3-compatible storage to replace MinIO (spike 10)~~ Decided: [ADR-0011](adr/0011-local-object-storage.md)
 - ~~Chunking strategy, chunk size, keyed chunk ID scheme (spike 04)~~ Decided: [ADR-0009](adr/0009-chunking-and-chunk-ids.md), [ADR-0010](adr/0010-chunk-storage-and-manifests.md)
-- Delete/rename semantics and retention (spike 05)
+- ~~Delete/rename semantics and retention (spike 05)~~ Decided: [ADR-0012](adr/0012-deletes-tombstones-and-trash.md), [ADR-0013](adr/0013-move-detection-and-mass-delete-guard.md)
+- Version retention period for live files (goal 5), independent of the 30-day trash
 - Windows support timing (spike 06 informs)
 - Device authentication and revocation (spike 08)
 - AWS monthly budget target (spike 09)
@@ -92,23 +93,25 @@ API ──► change notifications ──► other clients pull changes
 
 ## 9. Data model
 
-Partially decided. Files are identified by stable ID ([ADR-0004](adr/0004-stable-file-ids.md)); changes are tracked in a server log ([ADR-0003](adr/0003-sync-model.md)); content and location are versioned separately ([ADR-0006](adr/0006-separate-content-and-location-revisions.md)); content is stored as keyed chunks with encrypted manifests ([ADR-0009](adr/0009-chunking-and-chunk-ids.md), [ADR-0010](adr/0010-chunk-storage-and-manifests.md)). Delete retention pending spike 05.
+Partially decided. Files are identified by stable ID ([ADR-0004](adr/0004-stable-file-ids.md)); changes are tracked in a server log ([ADR-0003](adr/0003-sync-model.md)); content and location are versioned separately ([ADR-0006](adr/0006-separate-content-and-location-revisions.md)); content is stored as keyed chunks with encrypted manifests ([ADR-0009](adr/0009-chunking-and-chunk-ids.md), [ADR-0010](adr/0010-chunk-storage-and-manifests.md)); deletes are tombstones with a 30-day trash ([ADR-0012](adr/0012-deletes-tombstones-and-trash.md)).
 
 **Server (Postgres)**
 
 | Table | Key columns | Notes |
 |---|---|---|
-| `nodes` | `id` (stable, server-assigned), `parent_id`, `name`, `kind` (file/folder), `content_rev`, `location_rev`, `deleted` | Path is derived from `parent_id` + `name`. Live names unique per folder, **case-insensitive**. No folder cycles. Current content is the `revisions` row matching `content_rev`. |
+| `nodes` | `id` (stable, server-assigned), `parent_id`, `name`, `kind` (file/folder), `content_rev`, `location_rev`, `deleted`, `deleted_at`, `deleted_by`, `purged_at` | Path is derived from `parent_id` + `name`. Live names unique per folder, **case-insensitive**. No folder cycles. Current content is the `revisions` row matching `content_rev`. Deleted nodes stay restorable for the trash period, then are purged (revisions and name dropped) but kept forever as a stub. `deleted_by` is the `seq` of the delete, so a folder delete and its restore cover exactly the same descendants. |
 | `revisions` | `node_id`, `content_rev`, `manifest` (encrypted blob), `created_at` | One row per retained content revision (version history, goal 5). The manifest (ordered chunk IDs and plaintext lengths) is readable only by clients. |
 | `revision_refs` | `node_id`, `content_rev`, `chunk_id` | Unordered set of chunks a revision uses. Server-visible, for refcounting and GC. |
 | `chunks` | `chunk_id` (keyed HMAC-SHA256), `id_scheme`, `object_key`, `offset`, `length`, `created_at`, `unreferenced_since` | Location index: in v1 each chunk is its own padded object at offset 0, ready for pack objects later. GC deletes chunks unreferenced longer than the grace period (24 h, configurable). |
-| `changes` | `seq` (monotonic), `node_id`, `content_rev`, `location_rev`, `op` (create/modify/move/delete), `created_at` | Append-only. Writes serialized so `seq` becomes visible in order. Pruned after the retention window. |
+| `changes` | `seq` (monotonic), `node_id`, `content_rev`, `location_rev`, `op` (create/modify/move/delete/restore), `created_at` | Append-only. Writes serialized so `seq` becomes visible in order. Pruned after the retention window. |
 | `log_meta` | `epoch` (random ID) | Regenerated when the database is restored from backup. |
 
 **Client (local store, per device)**
 
 - Server `epoch` and `cursor` (last applied `seq`).
-- Per node: `id`, local path, synced `content_rev` and `location_rev`, content hash at last sync, size + mtime at last sync. This is the synced baseline used to classify local vs remote changes. The content hash is a keyed hash over the file's ordered chunk IDs.
+- Per node: `id`, `parent_id` + `name` (not a full path, so a folder move updates one row), synced `content_rev` and `location_rev`, content hash at last sync, size + mtime at last sync, `inode` + `device_id`. This is the synced baseline used to classify local vs remote changes. The content hash is a keyed hash over the file's ordered chunk IDs.
+- A pending-delete queue with timestamps, holding local deletes ~60 s for move pairing ([ADR-0013](adr/0013-move-detection-and-mass-delete-guard.md)).
+- A hidden root marker file in the sync folder; if it's missing, sync stops (mass-delete protection).
 
 **Object store**
 
@@ -144,9 +147,19 @@ Partially decided ([ADR-0003](adr/0003-sync-model.md), [ADR-0005](adr/0005-confl
 - Conflicted copies sync to every device. Resolution is idempotent across retries.
 - The user is notified through the filename, a warning log line, and `cloudfs conflicts`.
 
+**Deletes, restores and moves** ([ADR-0012](adr/0012-deletes-tombstones-and-trash.md), [ADR-0013](adr/0013-move-detection-and-mass-delete-guard.md))
+- A delete tombstones the node (base `content_rev`). A folder delete is one change; all live descendants are marked with the same `deleted_by` in the same transaction.
+- A restore within the trash period revives the **same node ID** with a new `content_rev` (`op = restore`).
+- A rename or move is one `location_rev` bump, including folder moves.
+- Remote deletes are applied locally as plain deletes after checking the file has no unsynced edits (edit wins otherwise).
+- Local moves are recognised in order: same path → modify; same inode + device → move; exactly one disappeared file with the same size and content hash → move; otherwise delete + create.
+- **Mass-delete guard:** missing root marker → stop syncing. More than 50% of synced files or more than 1,000 files deleted in one batch (configurable) → pause and require confirmation.
+
 **Full reconcile** (compare local files, baseline, and a full server listing) happens when:
 - the cursor is older than the log retention window (**cursor too old**), or
 - the server's `epoch` differs from the device's (**server restored**). Files deleted between backup and restore may reappear, an accepted trade-off.
+
+Because tombstones are kept forever as stubs, the server listing always says explicitly when a node was deleted. For a node with no server record at all: epoch changed → re-upload; epoch unchanged → delete locally, unless the local copy differs from the baseline, in which case re-upload as a new node.
 
 ## 11. Security
 
@@ -188,6 +201,7 @@ Baseline commitments: TLS everywhere, least-privilege IAM per service, no long-l
 Operational settings decided so far:
 - **Change log retention:** 90 days, configurable ([ADR-0003](adr/0003-sync-model.md)).
 - **Database restore:** regenerate `log_meta.epoch` as part of the restore runbook, and log the event clearly.
+- **Trash:** 30 days, configurable; then purge to a stub. Tombstone stubs are kept forever ([ADR-0012](adr/0012-deletes-tombstones-and-trash.md)). A trash-purge worker runs alongside chunk GC.
 - **At-rest encryption (AWS):** S3 default SSE-S3; RDS encryption enabled at creation (can't be added later). Upgrade path to a customer-managed KMS key is in [ADR-0008](adr/0008-at-rest-encryption-aws.md).
 
 ## 13. Observability
@@ -206,6 +220,7 @@ Operational settings decided so far:
 
 ## Changelog
 
+- **0.7** (2026-11-23): Spike 05 decided. Tombstone stubs kept forever, 30-day trash with same-ID restore, single-change folder deletes and moves (ADR-0012); client move detection and mass-delete guard (ADR-0013); §9, §10, §12 updated; version retention added as an open question.
 - **0.6** (2026-11-20): Spike 10 decided. Minimal S3 contract with Garage as the pinned local store and the only real store tested for now, plus gofakes3 for unit tests (ADR-0011); goal 7 and the architecture sketch name Garage instead of MinIO; §12 gains the object storage section with untested alternatives.
 - **0.5** (2026-11-20): Spike 04 decided. Keyed FastCDC + HMAC-SHA256 chunk IDs (ADR-0009); one padded object per chunk with a location index and encrypted manifests (ADR-0010); §9 gains `revisions`, `revision_refs`, `chunks` and the object format; §10 gains the upload outline.
 - **0.4** (2026-11-19): Spike 03 decided. End-to-end encryption in v1 (ADR-0007) and free at-rest defaults on AWS with a KMS upgrade path (ADR-0008); §11 Security filled in; goal 9 added; goal 7 notes the MinIO replacement (spike 10); new open questions for spikes 10 and 11.
