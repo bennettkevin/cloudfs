@@ -1,7 +1,7 @@
 # CloudFS Design Doc
 
-- **Version:** 0.12 (draft, Sprint 0)
-- **Last reviewed:** 2026-11-19
+- **Version:** 1.0 (end of Sprint 0)
+- **Last reviewed:** 2026-11-24
 
 This is a living document. It's updated at each sprint review to match what's actually decided and built. Individual decisions and their reasoning live in [ADRs](adr/), and research findings in [research/](research/).
 
@@ -24,7 +24,7 @@ Secondary goal: CloudFS is a learning and portfolio project for cloud architectu
 2. When devices are online, changes propagate within seconds.
 3. Offline edits reconcile when the device reconnects.
 4. **No silent data loss.** Conflicting edits keep both versions.
-5. Previous file versions are retained for a configurable period.
+5. Previous file versions are retained for a configurable period (default 30 days).
 6. A small change to a large file uploads only the changed part.
 7. The same codebase runs locally (Garage and Postgres in Compose) and in AWS (S3, RDS, ECS), switched by configuration ([ADR-0011](adr/0011-local-object-storage.md)).
 8. AWS infrastructure is fully reproducible from Terraform and fully removable with `terraform destroy`.
@@ -41,20 +41,20 @@ Secondary goal: CloudFS is a learning and portfolio project for cloud architectu
 
 ## 5. Success criteria
 
-Phase-level checks that define "done". Numbers marked TBD get set once spikes give us a baseline.
+Phase-level checks that define "done".
 
 - Sync a mixed folder (≥1 GB, ≥10k files) between two devices with no differences afterwards.
-- Edit 1 MB inside a 1 GB file: upload size is a small fraction of the file (target TBD after the chunking spike).
+- Edit 1 MB inside a 1 GB file: at most 16 MiB is uploaded (a few chunks of up to 4 MiB each, [ADR-0009](adr/0009-chunking-and-chunk-ids.md)).
 - Edit the same file on two offline devices, then reconnect both: both versions survive, and the conflict is visible to the user.
 - Fresh AWS account → working deployment via Terraform and CI, with no manual console steps.
 - `terraform destroy` leaves no billable resources.
-- Documented idle and active monthly AWS cost (budget TBD, spike 09).
+- Documented idle and active monthly AWS cost, within the $10/month phase 2 budget outside deliberate always-on periods ([ADR-0019](adr/0019-phase-2-aws-architecture-and-cost-guardrails.md)).
 
 ## 6. Constraints
 
 - Solo, part-time developer working in 2-week sprints. Size work for school weeks, not for best-case weeks.
 - Go is new to the developer ([ADR-0001](adr/0001-use-go.md)). Early sprints include learning time.
-- Minimal AWS spend: use the free tier where possible, set a budget alarm before first deploy, and tear down when idle.
+- Minimal AWS spend: nothing before phase 2; then a $10/month budget with alarms before the first deploy, and the stack torn down when idle ([ADR-0019](adr/0019-phase-2-aws-architecture-and-cost-guardrails.md)).
 - Open source under the MIT License.
 
 ## 7. Open questions
@@ -65,13 +65,13 @@ Each one maps to a research spike ([index](research/README.md)).
 - ~~Conflict resolution behaviour (spike 02)~~ Decided: [ADR-0005](adr/0005-conflict-resolution.md), [ADR-0006](adr/0006-separate-content-and-location-revisions.md)
 - ~~End-to-end encryption, yes or no (spike 03)~~ Decided: [ADR-0007](adr/0007-end-to-end-encryption.md) (E2E in v1), [ADR-0008](adr/0008-at-rest-encryption-aws.md) (AWS at-rest defaults)
 - ~~File/folder name encryption and blind index for unique names (spike 11)~~ Decided: [ADR-0017](adr/0017-encrypted-names-and-blind-index.md)
-- Key hierarchy, passphrase/recovery key, new-device onboarding (designed in phase 1 encryption work)
+- Key hierarchy, passphrase/recovery key, new-device onboarding: **still open**, designed in Phase 1 Sprint 3 with its own ADR
 - ~~Local S3-compatible storage to replace MinIO (spike 10)~~ Decided: [ADR-0011](adr/0011-local-object-storage.md)
 - ~~Chunking strategy, chunk size, keyed chunk ID scheme (spike 04)~~ Decided: [ADR-0009](adr/0009-chunking-and-chunk-ids.md), [ADR-0010](adr/0010-chunk-storage-and-manifests.md)
 - ~~Delete/rename semantics and retention (spike 05)~~ Decided: [ADR-0012](adr/0012-deletes-tombstones-and-trash.md), [ADR-0013](adr/0013-move-detection-and-mass-delete-guard.md)
-- Version retention period for live files (goal 5), independent of the 30-day trash. A product choice: spike 09 puts the cost at about $0.12/month for 30 days and at most $1.38/month for a year at this scale.
+- ~~Version retention period for live files (goal 5)~~ Decided 2026-11-24: **30 days, configurable**, matching the trash. Product choice; spike 09 puts the storage cost at about $0.12/month at this scale.
 - ~~Upload path, upload verification and orphan cleanup (spike 07)~~ Decided: [ADR-0015](adr/0015-direct-presigned-chunk-transfer.md), [ADR-0016](adr/0016-upload-reservations-and-idempotent-commits.md)
-- Windows support timing. Spike 06 ([ADR-0014](adr/0014-local-change-detection.md)) puts the watcher behind an interface so a ReadDirectoryChangesW backend can be added later; timing still open.
+- ~~Windows support timing~~ Decided 2026-11-24: **after v1**. The watcher interface ([ADR-0014](adr/0014-local-change-detection.md)) leaves room for a ReadDirectoryChangesW backend; NTFS name equality needs checking then ([ADR-0017](adr/0017-encrypted-names-and-blind-index.md)).
 - ~~Device authentication and revocation (spike 08)~~ Decided: [ADR-0018](adr/0018-device-enrollment-and-tokens.md)
 - ~~AWS monthly budget target (spike 09)~~ Decided: [ADR-0019](adr/0019-phase-2-aws-architecture-and-cost-guardrails.md)
 
@@ -79,7 +79,7 @@ Each one maps to a research spike ([index](research/README.md)).
 
 ## 8. Architecture
 
-*Pending Sprint 0 spikes.* Starting sketch:
+Decided in Sprint 0 (ADR-0003 to ADR-0019). Code layout and core libraries: [ADR-0020](adr/0020-repository-layout-and-core-libraries.md).
 
 ```
 client daemon (watch → chunk → hash)
@@ -95,7 +95,7 @@ No bucket notifications: Postgres is the source of truth and the commit is the e
 
 ## 9. Data model
 
-Partially decided. Files are identified by stable ID ([ADR-0004](adr/0004-stable-file-ids.md)); changes are tracked in a server log ([ADR-0003](adr/0003-sync-model.md)); content and location are versioned separately ([ADR-0006](adr/0006-separate-content-and-location-revisions.md)); content is stored as keyed chunks with encrypted manifests ([ADR-0009](adr/0009-chunking-and-chunk-ids.md), [ADR-0010](adr/0010-chunk-storage-and-manifests.md)); deletes are tombstones with a 30-day trash ([ADR-0012](adr/0012-deletes-tombstones-and-trash.md)).
+Files are identified by stable ID ([ADR-0004](adr/0004-stable-file-ids.md)); changes are tracked in a server log ([ADR-0003](adr/0003-sync-model.md)); content and location are versioned separately ([ADR-0006](adr/0006-separate-content-and-location-revisions.md)); content is stored as keyed chunks with encrypted manifests ([ADR-0009](adr/0009-chunking-and-chunk-ids.md), [ADR-0010](adr/0010-chunk-storage-and-manifests.md)); deletes are tombstones with a 30-day trash ([ADR-0012](adr/0012-deletes-tombstones-and-trash.md)).
 
 **Server (Postgres)**
 
@@ -126,7 +126,7 @@ Partially decided. Files are identified by stable ID ([ADR-0004](adr/0004-stable
 
 ## 10. Sync protocol
 
-Partially decided ([ADR-0003](adr/0003-sync-model.md), [ADR-0005](adr/0005-conflict-resolution.md), [ADR-0006](adr/0006-separate-content-and-location-revisions.md), [ADR-0010](adr/0010-chunk-storage-and-manifests.md), [ADR-0015](adr/0015-direct-presigned-chunk-transfer.md), [ADR-0016](adr/0016-upload-reservations-and-idempotent-commits.md)).
+Decided in Sprint 0 ([ADR-0003](adr/0003-sync-model.md), [ADR-0005](adr/0005-conflict-resolution.md), [ADR-0006](adr/0006-separate-content-and-location-revisions.md), [ADR-0010](adr/0010-chunk-storage-and-manifests.md), [ADR-0015](adr/0015-direct-presigned-chunk-transfer.md), [ADR-0016](adr/0016-upload-reservations-and-idempotent-commits.md)).
 
 **Uploading content** ([ADR-0015](adr/0015-direct-presigned-chunk-transfer.md), [ADR-0016](adr/0016-upload-reservations-and-idempotent-commits.md))
 1. Client chunks the file with keyed FastCDC (256 KiB / 1 MiB / 4 MiB) and computes keyed chunk IDs ([ADR-0009](adr/0009-chunking-and-chunk-ids.md)).
@@ -265,6 +265,7 @@ Operational settings decided so far:
 - **Database restore:** regenerate `log_meta.epoch` as part of the restore runbook, and log the event clearly.
 - **Trash:** 30 days, configurable; then purge to a stub. Tombstone stubs are kept forever ([ADR-0012](adr/0012-deletes-tombstones-and-trash.md)). A trash-purge worker runs alongside chunk GC.
 - **Orphan cleanup:** reservation rows go through normal chunk GC; a weekly ListObjectsV2 sweep removes objects with no row older than the grace period ([ADR-0016](adr/0016-upload-reservations-and-idempotent-commits.md)).
+- **Version retention:** previous content revisions are kept 30 days by default (configurable, goal 5); older ones are pruned by the worker, and their chunks go through normal GC. The current revision is always kept.
 - **At-rest encryption (AWS):** S3 default SSE-S3; RDS encryption enabled at creation (can't be added later). Upgrade path to a customer-managed KMS key is in [ADR-0008](adr/0008-at-rest-encryption-aws.md).
 
 ## 13. Observability
@@ -281,8 +282,22 @@ Operational settings decided so far:
 | 3 | Operate | Metrics, autoscaling, load test, failure write-up, cost report |
 | 4 | Private network (stretch) | API reachable only through a self-run WireGuard gateway |
 
+**Phase 1 plan** (thin, demoable slices; adjusted at each sprint review)
+
+| Sprint | Dates | Slice |
+|---|---|---|
+| 1 | 2026-12-03 – 12-16 | Foundations: repo skeleton and CI, Compose stack, migrations, server skeleton, ObjectStore package with Garage contract tests ([ADR-0020](adr/0020-repository-layout-and-core-libraries.md)) |
+| 2 | 2026-12-17 – 12-30 | Half load (holidays): device enrollment and tokens ([ADR-0018](adr/0018-device-enrollment-and-tokens.md)) |
+| 3 | | Crypto core: key hierarchy ADR, keyed chunking, chunk encryption format, name encryption |
+| 4 | | Upload path and `cloudfs push`: missing-chunk query, upload URLs, commits, `nodes`/`revisions`/`changes` |
+| 5 | | Pull path: change cursor, safe local apply, downloads |
+| 6 | | Watcher, scanner, baseline, move detection |
+| 7 | | Conflicts, deletes and trash, mass-delete guard |
+| 8 | | Full reconcile, two-device end-to-end test, hardening, Phase 1 demo |
+
 ## Changelog
 
+- **1.0** (2026-11-24): End of Sprint 0. All spikes decided; version retention 30 days configurable; Windows after v1; success-criteria targets set (≤ 16 MiB upload for a 1 MB edit, $10/month budget); code layout and core libraries (ADR-0020); Phase 1 sprint plan in §14. The key hierarchy stays open for Phase 1 Sprint 3.
 - **0.12** (2026-11-24): Spike 09 decided. Phase 2 architecture (Fargate ARM, RDS t4g.micro, ALB, no NAT), on-demand by default with persistent/ephemeral Terraform modules, $10/month budget and guardrails (ADR-0019); §7 version retention cost note; §12 Phase 2 on AWS.
 - **0.11** (2026-11-24): Spike 08 decided. One-time activation codes for the first and every later device, client-generated per-device tokens stored as hashes, immediate revocation, 180-day idle expiry, `SecretStore` on the device, TLS required (ADR-0018); §9 `users`, `devices`, `enrollment_codes`, `changes.device_id`; §10 Enrolling a device; §11 Device authentication.
 - **0.10** (2026-11-24): Spike 11 decided. Client-side encrypted names with a per-folder blind index, canonical caseless matching (matches APFS), own fold function with a Cherokee fix, `name_scheme` (ADR-0017); §9 `nodes` columns, §10 commit fields, §11 Names.
