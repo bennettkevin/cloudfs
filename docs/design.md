@@ -1,6 +1,6 @@
 # CloudFS Design Doc
 
-- **Version:** 0.8 (draft, Sprint 0)
+- **Version:** 0.9 (draft, Sprint 0)
 - **Last reviewed:** 2026-11-19
 
 This is a living document. It's updated at each sprint review to match what's actually decided and built. Individual decisions and their reasoning live in [ADRs](adr/), and research findings in [research/](research/).
@@ -70,6 +70,7 @@ Each one maps to a research spike ([index](research/README.md)).
 - ~~Chunking strategy, chunk size, keyed chunk ID scheme (spike 04)~~ Decided: [ADR-0009](adr/0009-chunking-and-chunk-ids.md), [ADR-0010](adr/0010-chunk-storage-and-manifests.md)
 - ~~Delete/rename semantics and retention (spike 05)~~ Decided: [ADR-0012](adr/0012-deletes-tombstones-and-trash.md), [ADR-0013](adr/0013-move-detection-and-mass-delete-guard.md)
 - Version retention period for live files (goal 5), independent of the 30-day trash
+- ~~Upload path, upload verification and orphan cleanup (spike 07)~~ Decided: [ADR-0015](adr/0015-direct-presigned-chunk-transfer.md), [ADR-0016](adr/0016-upload-reservations-and-idempotent-commits.md)
 - Windows support timing. Spike 06 ([ADR-0014](adr/0014-local-change-detection.md)) puts the watcher behind an interface so a ReadDirectoryChangesW backend can be added later; timing still open.
 - Device authentication and revocation (spike 08)
 - AWS monthly budget target (spike 09)
@@ -85,11 +86,12 @@ client daemon (watch → chunk → hash)
    │ 1. "I have these chunk hashes"   ──► API (auth, metadata) ──► Postgres
    │ 2. presigned URLs for missing chunks
    │ 3. upload chunks directly        ──► object storage (S3 / Garage)
-                                              │ event
-                                              ▼
-                                           queue ──► workers (versioning, pruning)
+   │ 4. commit (server HEADs new chunks first)
 API ──► change notifications ──► other clients pull changes
+workers (GC, trash purge, weekly orphan sweep) ──► Postgres + object storage
 ```
+
+No bucket notifications: Postgres is the source of truth and the commit is the event ([ADR-0015](adr/0015-direct-presigned-chunk-transfer.md)).
 
 ## 9. Data model
 
@@ -102,8 +104,8 @@ Partially decided. Files are identified by stable ID ([ADR-0004](adr/0004-stable
 | `nodes` | `id` (stable, server-assigned), `parent_id`, `name`, `kind` (file/folder), `content_rev`, `location_rev`, `deleted`, `deleted_at`, `deleted_by`, `purged_at` | Path is derived from `parent_id` + `name`. Live names unique per folder, **case-insensitive**. No folder cycles. Current content is the `revisions` row matching `content_rev`. Deleted nodes stay restorable for the trash period, then are purged (revisions and name dropped) but kept forever as a stub. `deleted_by` is the `seq` of the delete, so a folder delete and its restore cover exactly the same descendants. |
 | `revisions` | `node_id`, `content_rev`, `manifest` (encrypted blob), `created_at` | One row per retained content revision (version history, goal 5). The manifest (ordered chunk IDs and plaintext lengths) is readable only by clients. |
 | `revision_refs` | `node_id`, `content_rev`, `chunk_id` | Unordered set of chunks a revision uses. Server-visible, for refcounting and GC. |
-| `chunks` | `chunk_id` (keyed HMAC-SHA256), `id_scheme`, `object_key`, `offset`, `length`, `created_at`, `unreferenced_since` | Location index: in v1 each chunk is its own padded object at offset 0, ready for pack objects later. GC deletes chunks unreferenced longer than the grace period (24 h, configurable). |
-| `changes` | `seq` (monotonic), `node_id`, `content_rev`, `location_rev`, `op` (create/modify/move/delete/restore), `created_at` | Append-only. Writes serialized so `seq` becomes visible in order. Pruned after the retention window. |
+| `chunks` | `chunk_id` (keyed HMAC-SHA256), `id_scheme`, `object_key`, `offset`, `length`, `created_at`, `uploaded_at`, `unreferenced_since` | Location index: in v1 each chunk is its own padded object at offset 0, ready for pack objects later. A row is created when an upload URL is issued (`uploaded_at` NULL) and confirmed by a HEAD at first commit ([ADR-0016](adr/0016-upload-reservations-and-idempotent-commits.md)). GC deletes chunks unreferenced longer than the grace period (24 h, configurable). |
+| `changes` | `seq` (monotonic), `node_id`, `content_rev`, `location_rev`, `op` (create/modify/move/delete/restore), `commit_id` (unique), `created_at` | Append-only. `commit_id` makes commit retries idempotent. Writes serialized so `seq` becomes visible in order. Pruned after the retention window. |
 | `log_meta` | `epoch` (random ID) | Regenerated when the database is restored from backup. |
 
 **Client (local store, per device)**
@@ -112,6 +114,7 @@ Partially decided. Files are identified by stable ID ([ADR-0004](adr/0004-stable
 - Per node: `id`, `parent_id` + `name` (not a full path, so a folder move updates one row), synced `content_rev` and `location_rev`, content hash at last sync, size + mtime at last sync, `inode` + `device_id`. This is the synced baseline used to classify local vs remote changes. The content hash is a keyed hash over the file's ordered chunk IDs.
 - A pending-delete queue with timestamps, holding local deletes ~60 s for move pairing ([ADR-0013](adr/0013-move-detection-and-mass-delete-guard.md)).
 - A hidden root marker file in the sync folder; if it's missing, sync stops (mass-delete protection).
+- A `commit_id` for each pending commit, reused on every retry, including after a restart.
 
 **Object store**
 
@@ -119,13 +122,18 @@ Partially decided. Files are identified by stable ID ([ADR-0004](adr/0004-stable
 
 ## 10. Sync protocol
 
-Partially decided ([ADR-0003](adr/0003-sync-model.md), [ADR-0005](adr/0005-conflict-resolution.md), [ADR-0006](adr/0006-separate-content-and-location-revisions.md), [ADR-0010](adr/0010-chunk-storage-and-manifests.md)). Exact upload API and SDK behaviour pending spike 07.
+Partially decided ([ADR-0003](adr/0003-sync-model.md), [ADR-0005](adr/0005-conflict-resolution.md), [ADR-0006](adr/0006-separate-content-and-location-revisions.md), [ADR-0010](adr/0010-chunk-storage-and-manifests.md), [ADR-0015](adr/0015-direct-presigned-chunk-transfer.md), [ADR-0016](adr/0016-upload-reservations-and-idempotent-commits.md)).
 
-**Uploading content** (outline)
+**Uploading content** ([ADR-0015](adr/0015-direct-presigned-chunk-transfer.md), [ADR-0016](adr/0016-upload-reservations-and-idempotent-commits.md))
 1. Client chunks the file with keyed FastCDC (256 KiB / 1 MiB / 4 MiB) and computes keyed chunk IDs ([ADR-0009](adr/0009-chunking-and-chunk-ids.md)).
-2. Client asks the server which chunk IDs it doesn't already have (one batch request).
-3. For each missing chunk: encrypt, pad, compute the ciphertext SHA-256, request a presigned PUT with that checksum signed in, upload directly to the object store.
-4. Client commits the new content revision: base `content_rev`, encrypted manifest, and the unordered chunk reference set.
+2. **Query:** client sends up to 1,000 chunk IDs; the server returns the missing ones (no row, or `uploaded_at` NULL) and refreshes the GC grace on present-but-unreferenced rows.
+3. **Request URLs:** for each missing chunk the client encrypts, pads, and sends `{id, length, sha256}` (up to 256 per call). The server derives the object key, rejects oversize lengths, upserts a reservation row, and returns presigned PUTs that sign the SHA-256 and `Content-Length`, with the exact headers to send and `expires_at` (15 min).
+4. **Upload:** client PUTs each chunk directly to the store (8–16 concurrent). Network errors and 5xx: back off and retry the same URL. Any 4xx: get a new URL and retry once, then stop and report.
+5. **Commit:** client sends base `content_rev`, encrypted manifest, unordered chunk reference set, and its `commit_id`. The server HEADs each unconfirmed chunk (outside the transaction), sets `uploaded_at`, then in one transaction checks every ref is confirmed and does the base-revision check. Replies: ok, conflict, or `missing: [ids]` (re-upload, then retry with the same `commit_id`). A known `commit_id` returns the original result.
+
+**Downloading content**
+- Presigned GETs with the same 15-minute expiry. In v1 each chunk is a whole object; with packs later the server signs a `Range` from the location index.
+- Integrity comes from the AEAD tag and recomputing the keyed chunk ID after decryption, not from S3 checksums.
 
 **Pulling remote changes**
 1. Device sends `epoch` + `cursor`; server returns changes with `seq > cursor` and a new cursor.
@@ -195,6 +203,12 @@ Baseline commitments: TLS everywhere, least-privilege IAM per service, no long-l
 - Losing the key loses the data, so onboarding must include a recovery key.
 - Device authentication (spike 08) is separate from encryption keys. Revoking a login doesn't revoke keys a device already has.
 
+**Presigned URLs** ([ADR-0015](adr/0015-direct-presigned-chunk-transfer.md))
+- An upload URL allows writing exactly one set of bytes (signed SHA-256 and length) to one server-chosen key for 15 minutes. A download URL exposes one chunk's ciphertext.
+- Clients never hold store credentials. Signer credentials are scoped to the one bucket.
+- Full presigned URLs are never logged (the signature is in the query string).
+- With direct transfer the object store sees device IP addresses in its logs (AWS in phase 2). Note this in any future privacy policy for hosted deployments.
+
 *Pending:* name encryption (spike 11), key hierarchy and onboarding (phase 1), device auth (spike 08).
 
 ## 12. Infrastructure
@@ -204,7 +218,8 @@ Baseline commitments: TLS everywhere, least-privilege IAM per service, no long-l
 **Object storage** ([ADR-0011](adr/0011-local-object-storage.md))
 - CloudFS uses only a minimal S3 contract: Put/Get/Head/Delete, ListObjectsV2, presigned PUT/GET with a signed `x-amz-checksum-sha256`, path-style addressing, range GET. No conditional writes, bucket notifications, versioning or server-side encryption.
 - Access goes through a Go `ObjectStore` interface over `aws-sdk-go-v2`. Switching stores is configuration only: endpoint, region, `UsePathStyle`, and checksum mode (`WhenRequired` by default, which works on AWS S3 and Garage alike).
-- **Local default:** Garage, single-node, version pinned in the Compose file.
+- **Local default:** Garage, single-node, pinned to **v2.5.0** in the Compose file (passed every spike 07 case). A new version is adopted only after it passes the same tests.
+- **Endpoints:** clients reach the store directly, so the server presigns against the **public** endpoint (self-hosters expose Garage's S3 API on its own HTTPS subdomain) and uses an internal endpoint for HEAD, DELETE and LIST ([ADR-0015](adr/0015-direct-presigned-chunk-transfer.md)).
 - **Testing layers:**
   - **Unit tests:** gofakes3, an in-process fake S3 server (no Docker).
   - **Integration and contract tests:** Garage via testcontainers-go. Garage is the only real store tested during initial development.
@@ -216,6 +231,7 @@ Operational settings decided so far:
 - **Change log retention:** 90 days, configurable ([ADR-0003](adr/0003-sync-model.md)).
 - **Database restore:** regenerate `log_meta.epoch` as part of the restore runbook, and log the event clearly.
 - **Trash:** 30 days, configurable; then purge to a stub. Tombstone stubs are kept forever ([ADR-0012](adr/0012-deletes-tombstones-and-trash.md)). A trash-purge worker runs alongside chunk GC.
+- **Orphan cleanup:** reservation rows go through normal chunk GC; a weekly ListObjectsV2 sweep removes objects with no row older than the grace period ([ADR-0016](adr/0016-upload-reservations-and-idempotent-commits.md)).
 - **At-rest encryption (AWS):** S3 default SSE-S3; RDS encryption enabled at creation (can't be added later). Upgrade path to a customer-managed KMS key is in [ADR-0008](adr/0008-at-rest-encryption-aws.md).
 
 ## 13. Observability
@@ -234,6 +250,7 @@ Operational settings decided so far:
 
 ## Changelog
 
+- **0.9** (2026-11-24): Spike 07 decided. Direct presigned chunk transfer with signed SHA-256 and length, 15-minute URLs, HEAD on commit, no bucket notifications, Garage pinned at v2.5.0 (ADR-0015); upload reservation rows, weekly orphan sweep, idempotent commits via `commit_id` (ADR-0016); architecture sketch drops the event queue; §9–§12 updated.
 - **0.8** (2026-11-23): Spike 06 decided. Local change detection with OS events as hints and scans as the truth, `rjeczalik/notify` watcher, safe apply of remote changes, NFC names, v1 skip and ignore rules (ADR-0014); §10 gains apply and detection subsections.
 - **0.7** (2026-11-23): Spike 05 decided. Tombstone stubs kept forever, 30-day trash with same-ID restore, single-change folder deletes and moves (ADR-0012); client move detection and mass-delete guard (ADR-0013); §9, §10, §12 updated; version retention added as an open question.
 - **0.6** (2026-11-20): Spike 10 decided. Minimal S3 contract with Garage as the pinned local store and the only real store tested for now, plus gofakes3 for unit tests (ADR-0011); goal 7 and the architecture sketch name Garage instead of MinIO; §12 gains the object storage section with untested alternatives.
