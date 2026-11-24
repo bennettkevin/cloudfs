@@ -1,6 +1,6 @@
 # CloudFS Design Doc
 
-- **Version:** 0.11 (draft, Sprint 0)
+- **Version:** 0.12 (draft, Sprint 0)
 - **Last reviewed:** 2026-11-19
 
 This is a living document. It's updated at each sprint review to match what's actually decided and built. Individual decisions and their reasoning live in [ADRs](adr/), and research findings in [research/](research/).
@@ -69,11 +69,11 @@ Each one maps to a research spike ([index](research/README.md)).
 - ~~Local S3-compatible storage to replace MinIO (spike 10)~~ Decided: [ADR-0011](adr/0011-local-object-storage.md)
 - ~~Chunking strategy, chunk size, keyed chunk ID scheme (spike 04)~~ Decided: [ADR-0009](adr/0009-chunking-and-chunk-ids.md), [ADR-0010](adr/0010-chunk-storage-and-manifests.md)
 - ~~Delete/rename semantics and retention (spike 05)~~ Decided: [ADR-0012](adr/0012-deletes-tombstones-and-trash.md), [ADR-0013](adr/0013-move-detection-and-mass-delete-guard.md)
-- Version retention period for live files (goal 5), independent of the 30-day trash
+- Version retention period for live files (goal 5), independent of the 30-day trash. A product choice: spike 09 puts the cost at about $0.12/month for 30 days and at most $1.38/month for a year at this scale.
 - ~~Upload path, upload verification and orphan cleanup (spike 07)~~ Decided: [ADR-0015](adr/0015-direct-presigned-chunk-transfer.md), [ADR-0016](adr/0016-upload-reservations-and-idempotent-commits.md)
 - Windows support timing. Spike 06 ([ADR-0014](adr/0014-local-change-detection.md)) puts the watcher behind an interface so a ReadDirectoryChangesW backend can be added later; timing still open.
 - ~~Device authentication and revocation (spike 08)~~ Decided: [ADR-0018](adr/0018-device-enrollment-and-tokens.md)
-- AWS monthly budget target (spike 09)
+- ~~AWS monthly budget target (spike 09)~~ Decided: [ADR-0019](adr/0019-phase-2-aws-architecture-and-cost-guardrails.md)
 
 ---
 
@@ -237,7 +237,15 @@ Baseline commitments: TLS everywhere, least-privilege IAM per service, no long-l
 
 ## 12. Infrastructure
 
-*AWS sizing pending spike 09.* Phase 1 local (Compose), phase 2 AWS (Terraform).
+Phase 1 local (Compose), phase 2 AWS (Terraform). Nothing before phase 2 needs an AWS account or any spending.
+
+**Phase 2 on AWS** ([ADR-0019](adr/0019-phase-2-aws-architecture-and-cost-guardrails.md))
+- **Shape:** ECS Fargate (ARM, 0.25 vCPU / 0.5 GB) running the API with workers as goroutines; RDS PostgreSQL `db.t4g.micro` Single-AZ, 20 GB gp3; ALB (dual-stack); S3; public subnets with security groups, **no NAT gateway, no interface endpoints**, free S3 gateway endpoint; SSM Parameter Store for secrets; CloudWatch Logs with 14-day retention.
+- **Run on demand by default:** Terraform `persistent` module (bucket, Route 53 zone, ECR, SSM, Budgets, OIDC role, optional KMS key) and `ephemeral` module (VPC, ALB, ECS, RDS), applied for demos and destroyed after. Metadata survives as a `pg_dump` in S3. Daily sync stays on the local Compose stack.
+- **Cost:** ≈ $2–6/month on demand; ≈ $49–51/month always on (≈ $45 with Fargate Spot). The ALB with its IPv4 addresses (~$24) and RDS (~$14) dominate; data path costs are ~$1.35/month at light use.
+- **Budget $10/month**, raised deliberately for always-on months. Before the first apply: AWS Budgets alerts (50%/80% actual, 100% forecast, 100% actual) plus a data-transfer-out usage budget, `default_tags` cost allocation tags, a destroy-check script, expensive features off by default, CI role limited to CloudFS services in one region, bucket policy denying non-TLS and signatures older than 15 minutes.
+- **KMS key:** optional, $1/month, not billed while pending deletion; in the `persistent` module if added.
+
 
 **Object storage** ([ADR-0011](adr/0011-local-object-storage.md))
 - CloudFS uses only a minimal S3 contract: Put/Get/Head/Delete, ListObjectsV2, presigned PUT/GET with a signed `x-amz-checksum-sha256`, path-style addressing, range GET. No conditional writes, bucket notifications, versioning or server-side encryption.
@@ -275,6 +283,7 @@ Operational settings decided so far:
 
 ## Changelog
 
+- **0.12** (2026-11-24): Spike 09 decided. Phase 2 architecture (Fargate ARM, RDS t4g.micro, ALB, no NAT), on-demand by default with persistent/ephemeral Terraform modules, $10/month budget and guardrails (ADR-0019); §7 version retention cost note; §12 Phase 2 on AWS.
 - **0.11** (2026-11-24): Spike 08 decided. One-time activation codes for the first and every later device, client-generated per-device tokens stored as hashes, immediate revocation, 180-day idle expiry, `SecretStore` on the device, TLS required (ADR-0018); §9 `users`, `devices`, `enrollment_codes`, `changes.device_id`; §10 Enrolling a device; §11 Device authentication.
 - **0.10** (2026-11-24): Spike 11 decided. Client-side encrypted names with a per-folder blind index, canonical caseless matching (matches APFS), own fold function with a Cherokee fix, `name_scheme` (ADR-0017); §9 `nodes` columns, §10 commit fields, §11 Names.
 - **0.9** (2026-11-24): Spike 07 decided. Direct presigned chunk transfer with signed SHA-256 and length, 15-minute URLs, HEAD on commit, no bucket notifications, Garage pinned at v2.5.0 (ADR-0015); upload reservation rows, weekly orphan sweep, idempotent commits via `commit_id` (ADR-0016); architecture sketch drops the event queue; §9–§12 updated.
