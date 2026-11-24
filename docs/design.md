@@ -1,6 +1,6 @@
 # CloudFS Design Doc
 
-- **Version:** 0.9 (draft, Sprint 0)
+- **Version:** 0.10 (draft, Sprint 0)
 - **Last reviewed:** 2026-11-19
 
 This is a living document. It's updated at each sprint review to match what's actually decided and built. Individual decisions and their reasoning live in [ADRs](adr/), and research findings in [research/](research/).
@@ -64,7 +64,7 @@ Each one maps to a research spike ([index](research/README.md)).
 - ~~Sync model: server change log + cursor vs version vectors (spike 01)~~ Decided: [ADR-0003](adr/0003-sync-model.md), [ADR-0004](adr/0004-stable-file-ids.md)
 - ~~Conflict resolution behaviour (spike 02)~~ Decided: [ADR-0005](adr/0005-conflict-resolution.md), [ADR-0006](adr/0006-separate-content-and-location-revisions.md)
 - ~~End-to-end encryption, yes or no (spike 03)~~ Decided: [ADR-0007](adr/0007-end-to-end-encryption.md) (E2E in v1), [ADR-0008](adr/0008-at-rest-encryption-aws.md) (AWS at-rest defaults)
-- File/folder name encryption and blind index for unique names (spike 11)
+- ~~File/folder name encryption and blind index for unique names (spike 11)~~ Decided: [ADR-0017](adr/0017-encrypted-names-and-blind-index.md)
 - Key hierarchy, passphrase/recovery key, new-device onboarding (designed in phase 1 encryption work)
 - ~~Local S3-compatible storage to replace MinIO (spike 10)~~ Decided: [ADR-0011](adr/0011-local-object-storage.md)
 - ~~Chunking strategy, chunk size, keyed chunk ID scheme (spike 04)~~ Decided: [ADR-0009](adr/0009-chunking-and-chunk-ids.md), [ADR-0010](adr/0010-chunk-storage-and-manifests.md)
@@ -101,7 +101,7 @@ Partially decided. Files are identified by stable ID ([ADR-0004](adr/0004-stable
 
 | Table | Key columns | Notes |
 |---|---|---|
-| `nodes` | `id` (stable, server-assigned), `parent_id`, `name`, `kind` (file/folder), `content_rev`, `location_rev`, `deleted`, `deleted_at`, `deleted_by`, `purged_at` | Path is derived from `parent_id` + `name`. Live names unique per folder, **case-insensitive**. No folder cycles. Current content is the `revisions` row matching `content_rev`. Deleted nodes stay restorable for the trash period, then are purged (revisions and name dropped) but kept forever as a stub. `deleted_by` is the `seq` of the delete, so a folder delete and its restore cover exactly the same descendants. |
+| `nodes` | `id` (stable, server-assigned), `parent_id`, `name_ct`, `name_index`, `name_scheme`, `kind` (file/folder), `content_rev`, `location_rev`, `deleted`, `deleted_at`, `deleted_by`, `purged_at` | Path is derived from `parent_id` + name. Names are encrypted by the client (`name_ct`); `name_index` is a keyed hash of the case-folded name, and `(parent_id, name_index)` is unique for live nodes, so live names are unique per folder, **case-insensitive** ([ADR-0017](adr/0017-encrypted-names-and-blind-index.md)). No folder cycles. Current content is the `revisions` row matching `content_rev`. Deleted nodes stay restorable for the trash period, then are purged (revisions, `name_ct` and `name_index` dropped) but kept forever as a stub. `deleted_by` is the `seq` of the delete, so a folder delete and its restore cover exactly the same descendants. |
 | `revisions` | `node_id`, `content_rev`, `manifest` (encrypted blob), `created_at` | One row per retained content revision (version history, goal 5). The manifest (ordered chunk IDs and plaintext lengths) is readable only by clients. |
 | `revision_refs` | `node_id`, `content_rev`, `chunk_id` | Unordered set of chunks a revision uses. Server-visible, for refcounting and GC. |
 | `chunks` | `chunk_id` (keyed HMAC-SHA256), `id_scheme`, `object_key`, `offset`, `length`, `created_at`, `uploaded_at`, `unreferenced_since` | Location index: in v1 each chunk is its own padded object at offset 0, ready for pack objects later. A row is created when an upload URL is issued (`uploaded_at` NULL) and confirmed by a HEAD at first commit ([ADR-0016](adr/0016-upload-reservations-and-idempotent-commits.md)). GC deletes chunks unreferenced longer than the grace period (24 h, configurable). |
@@ -155,8 +155,8 @@ Partially decided ([ADR-0003](adr/0003-sync-model.md), [ADR-0005](adr/0005-confl
 - Skipped and logged in v1: symlinks, FIFOs, sockets, device files. Ignored: `.cloudfs/` and built-in OS/editor junk patterns. A user `.cloudfsignore` is deferred.
 
 **Committing a local change**
-1. Device sends the node ID, the change, and the **base revision** for the group it changes: `content_rev` for edits and deletes, `location_rev` for renames and moves.
-2. In one transaction the server checks that base revision and the structural invariants (unique case-insensitive name, no cycle, live parent). On success it bumps the revision and appends to `changes`.
+1. Device sends the node ID, the change, and the **base revision** for the group it changes: `content_rev` for edits and deletes, `location_rev` for renames and moves. Creates, renames, moves and restores also carry `name_ct` and `name_index`.
+2. In one transaction the server checks that base revision and the structural invariants (unique `name_index` in the folder, no cycle, live parent). On success it bumps the revision and appends to `changes`.
 3. On a stale base or an invariant failure, the server rejects with a conflict response, and the device resolves it with ordinary commits.
 
 **Resolving a rejection** ([ADR-0005](adr/0005-conflict-resolution.md)). Rule: if bytes could be lost, keep both; if only names or locations differ, a fixed rule decides.
@@ -209,7 +209,12 @@ Baseline commitments: TLS everywhere, least-privilege IAM per service, no long-l
 - Full presigned URLs are never logged (the signature is in the query string).
 - With direct transfer the object store sees device IP addresses in its logs (AWS in phase 2). Note this in any future privacy policy for hosted deployments.
 
-*Pending:* name encryption (spike 11), key hierarchy and onboarding (phase 1), device auth (spike 08).
+**Names** ([ADR-0017](adr/0017-encrypted-names-and-blind-index.md))
+- Encrypted on the client with randomized XChaCha20-Poly1305, padded to 32-byte blocks, bound to `node_id ‖ parent_id`, so the server can't swap names or silently move nodes.
+- Uniqueness uses a per-folder blind index: `HMAC-SHA256(index_key, parent_id ‖ NFC(fold(NFD(name))))`. "Same name" follows Unicode canonical caseless matching, which matches APFS. CloudFS owns its fold function (Go's `x/text` is wrong for Cherokee, golang/go#46101) and tests it against Unicode's `CaseFolding.txt`.
+- The server learns only whether two names in one folder collide, plus each name's length to within 32 bytes. It can't sort, search or display names; logs carry node IDs only.
+
+*Pending:* key hierarchy and onboarding (phase 1, must derive separate `name_key` and `index_key`), device auth (spike 08).
 
 ## 12. Infrastructure
 
@@ -250,6 +255,7 @@ Operational settings decided so far:
 
 ## Changelog
 
+- **0.10** (2026-11-24): Spike 11 decided. Client-side encrypted names with a per-folder blind index, canonical caseless matching (matches APFS), own fold function with a Cherokee fix, `name_scheme` (ADR-0017); §9 `nodes` columns, §10 commit fields, §11 Names.
 - **0.9** (2026-11-24): Spike 07 decided. Direct presigned chunk transfer with signed SHA-256 and length, 15-minute URLs, HEAD on commit, no bucket notifications, Garage pinned at v2.5.0 (ADR-0015); upload reservation rows, weekly orphan sweep, idempotent commits via `commit_id` (ADR-0016); architecture sketch drops the event queue; §9–§12 updated.
 - **0.8** (2026-11-23): Spike 06 decided. Local change detection with OS events as hints and scans as the truth, `rjeczalik/notify` watcher, safe apply of remote changes, NFC names, v1 skip and ignore rules (ADR-0014); §10 gains apply and detection subsections.
 - **0.7** (2026-11-23): Spike 05 decided. Tombstone stubs kept forever, 30-day trash with same-ID restore, single-change folder deletes and moves (ADR-0012); client move detection and mass-delete guard (ADR-0013); §9, §10, §12 updated; version retention added as an open question.
