@@ -18,4 +18,4 @@ Ordered roughly by how much they constrain everything else.
 | 08 | Device auth | How a headless daemon authenticates and how devices are revoked | API |
 | 09 | AWS cost model | Idle cost of NAT gateway, RDS, ALB, Fargate; what to design around | Phase 2 infra |
 | 10 | Local object storage ([findings](10-local-object-storage.md), decided) | Replacement for MinIO (archived 2026-04): Garage, SeaweedFS, AIStor Free, forks | Goal 7, infra |
-| 11 | Name encryption | Encrypt file/folder names? Blind index for case-insensitive uniqueness; compute cost; Unicode normalization | Data model, protocol |
+| 11 | Name encryption ([findings](11-name-encryption.md), decided) | Encrypt file/folder names? Blind index for case-insensitive uniqueness; compute cost; Unicode normalization | Data model, protocol |
