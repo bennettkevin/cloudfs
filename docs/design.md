@@ -1,6 +1,6 @@
 # CloudFS Design Doc
 
-- **Version:** 0.10 (draft, Sprint 0)
+- **Version:** 0.11 (draft, Sprint 0)
 - **Last reviewed:** 2026-11-19
 
 This is a living document. It's updated at each sprint review to match what's actually decided and built. Individual decisions and their reasoning live in [ADRs](adr/), and research findings in [research/](research/).
@@ -72,7 +72,7 @@ Each one maps to a research spike ([index](research/README.md)).
 - Version retention period for live files (goal 5), independent of the 30-day trash
 - ~~Upload path, upload verification and orphan cleanup (spike 07)~~ Decided: [ADR-0015](adr/0015-direct-presigned-chunk-transfer.md), [ADR-0016](adr/0016-upload-reservations-and-idempotent-commits.md)
 - Windows support timing. Spike 06 ([ADR-0014](adr/0014-local-change-detection.md)) puts the watcher behind an interface so a ReadDirectoryChangesW backend can be added later; timing still open.
-- Device authentication and revocation (spike 08)
+- ~~Device authentication and revocation (spike 08)~~ Decided: [ADR-0018](adr/0018-device-enrollment-and-tokens.md)
 - AWS monthly budget target (spike 09)
 
 ---
@@ -105,8 +105,11 @@ Partially decided. Files are identified by stable ID ([ADR-0004](adr/0004-stable
 | `revisions` | `node_id`, `content_rev`, `manifest` (encrypted blob), `created_at` | One row per retained content revision (version history, goal 5). The manifest (ordered chunk IDs and plaintext lengths) is readable only by clients. |
 | `revision_refs` | `node_id`, `content_rev`, `chunk_id` | Unordered set of chunks a revision uses. Server-visible, for refcounting and GC. |
 | `chunks` | `chunk_id` (keyed HMAC-SHA256), `id_scheme`, `object_key`, `offset`, `length`, `created_at`, `uploaded_at`, `unreferenced_since` | Location index: in v1 each chunk is its own padded object at offset 0, ready for pack objects later. A row is created when an upload URL is issued (`uploaded_at` NULL) and confirmed by a HEAD at first commit ([ADR-0016](adr/0016-upload-reservations-and-idempotent-commits.md)). GC deletes chunks unreferenced longer than the grace period (24 h, configurable). |
-| `changes` | `seq` (monotonic), `node_id`, `content_rev`, `location_rev`, `op` (create/modify/move/delete/restore), `commit_id` (unique), `created_at` | Append-only. `commit_id` makes commit retries idempotent. Writes serialized so `seq` becomes visible in order. Pruned after the retention window. |
+| `changes` | `seq` (monotonic), `node_id`, `content_rev`, `location_rev`, `op` (create/modify/move/delete/restore), `commit_id` (unique), `device_id`, `created_at` | Append-only. `commit_id` makes commit retries idempotent. Writes serialized so `seq` becomes visible in order. Pruned after the retention window. |
 | `log_meta` | `epoch` (random ID) | Regenerated when the database is restored from backup. |
+| `users` | `id`, `created_at` | One row in v1; keeps the auth principal multi-user-shaped ([ADR-0002](adr/0002-single-user-first.md)). |
+| `devices` | `id`, `user_id`, `name`, `platform`, `client_version`, `token_hash`, `public_key` (reserved), `enrolled_by_device_id`, `created_at`, `last_seen_at`, `last_seen_ip`, `revoked_at` | One row per enrolled device ([ADR-0018](adr/0018-device-enrollment-and-tokens.md)). `token_hash` is SHA-256 of the device's token, cleared on revoke. Active names unique per user, case-insensitive. Last seen: time and latest IP only. |
+| `enrollment_codes` | `id`, `code_hash` (argon2id), `salt`, `created_by_device_id`, `created_at`, `expires_at`, `failed_attempts`, `used_at`, `used_by_device_id` | One-time activation codes, 15-minute life. Deleted a day after use or expiry. |
 
 **Client (local store, per device)**
 
@@ -115,6 +118,7 @@ Partially decided. Files are identified by stable ID ([ADR-0004](adr/0004-stable
 - A pending-delete queue with timestamps, holding local deletes ~60 s for move pairing ([ADR-0013](adr/0013-move-detection-and-mass-delete-guard.md)).
 - A hidden root marker file in the sync folder; if it's missing, sync stops (mass-delete protection).
 - A `commit_id` for each pending commit, reused on every retry, including after a restart.
+- The device token, in the macOS Keychain or a `0600` file (`SecretStore` interface).
 
 **Object store**
 
@@ -134,6 +138,14 @@ Partially decided ([ADR-0003](adr/0003-sync-model.md), [ADR-0005](adr/0005-confl
 **Downloading content**
 - Presigned GETs with the same 15-minute expiry. In v1 each chunk is a whole object; with packs later the server signs a `Range` from the location index.
 - Integrity comes from the AEAD tag and recomputing the keyed chunk ID after decryption, not from S3 checksums.
+
+**Enrolling a device** ([ADR-0018](adr/0018-device-enrollment-and-tokens.md))
+1. The admin CLI (`cloudfs-server enroll`) or an enrolled device (`cloudfs device add`) creates a one-time code `XXXXX-XXXXX`: 15 minutes, single use, at most 5 active, all invalidated after 10 failed attempts.
+2. On the new device, `cloudfs login <server>` asks for the code, generates its own token (`cfs_` + 32 random bytes), and sends the code, device name, platform, version and the token's SHA-256.
+3. The server checks the code, marks it used and creates the device in one transaction. Retrying with the same code and hash returns the same result.
+4. The device stores its token and sends it as `Authorization: Bearer` on every request.
+
+The first device on a fresh server uses the same flow with a code from the admin CLI.
 
 **Pulling remote changes**
 1. Device sends `epoch` + `cursor`; server returns changes with `seq > cursor` and a new cursor.
@@ -214,7 +226,14 @@ Baseline commitments: TLS everywhere, least-privilege IAM per service, no long-l
 - Uniqueness uses a per-folder blind index: `HMAC-SHA256(index_key, parent_id ‖ NFC(fold(NFD(name))))`. "Same name" follows Unicode canonical caseless matching, which matches APFS. CloudFS owns its fold function (Go's `x/text` is wrong for Cherokee, golang/go#46101) and tests it against Unicode's `CaseFolding.txt`.
 - The server learns only whether two names in one folder collide, plus each name's length to within 32 bytes. It can't sort, search or display names; logs carry node IDs only.
 
-*Pending:* key hierarchy and onboarding (phase 1, must derive separate `name_key` and `index_key`), device auth (spike 08).
+**Device authentication** ([ADR-0018](adr/0018-device-enrollment-and-tokens.md))
+- One-time activation codes (argon2id-hashed, rate-limited) enroll devices; each device then has its own random token, stored server-side only as a SHA-256 hash.
+- One middleware authorizes every route except enroll and health, from a Postgres lookup on every request (no cache), so revoking a device takes effect on its next request. Presigned URLs already issued expire within 15 minutes.
+- Devices unused for 180 days are revoked automatically (configurable). Revoking can cascade to devices the revoked one enrolled.
+- TLS is required; plain HTTP only to localhost; no skip-verify option. `X-Forwarded-For` is trusted only from configured proxies.
+- New user data: device name (also in conflicted-copy filenames), platform, client version, last-seen time and latest IP (can be turned off), which device enrolled which and made each change, failed-enrollment IPs in logs.
+
+*Pending:* key hierarchy and onboarding (phase 1, must derive separate `name_key` and `index_key`).
 
 ## 12. Infrastructure
 
@@ -234,6 +253,7 @@ Baseline commitments: TLS everywhere, least-privilege IAM per service, no long-l
 
 Operational settings decided so far:
 - **Change log retention:** 90 days, configurable ([ADR-0003](adr/0003-sync-model.md)).
+- **Device idle expiry:** 180 days, configurable; 0 turns it off ([ADR-0018](adr/0018-device-enrollment-and-tokens.md)). The worker also deletes used and expired enrollment codes after a day.
 - **Database restore:** regenerate `log_meta.epoch` as part of the restore runbook, and log the event clearly.
 - **Trash:** 30 days, configurable; then purge to a stub. Tombstone stubs are kept forever ([ADR-0012](adr/0012-deletes-tombstones-and-trash.md)). A trash-purge worker runs alongside chunk GC.
 - **Orphan cleanup:** reservation rows go through normal chunk GC; a weekly ListObjectsV2 sweep removes objects with no row older than the grace period ([ADR-0016](adr/0016-upload-reservations-and-idempotent-commits.md)).
@@ -255,6 +275,7 @@ Operational settings decided so far:
 
 ## Changelog
 
+- **0.11** (2026-11-24): Spike 08 decided. One-time activation codes for the first and every later device, client-generated per-device tokens stored as hashes, immediate revocation, 180-day idle expiry, `SecretStore` on the device, TLS required (ADR-0018); §9 `users`, `devices`, `enrollment_codes`, `changes.device_id`; §10 Enrolling a device; §11 Device authentication.
 - **0.10** (2026-11-24): Spike 11 decided. Client-side encrypted names with a per-folder blind index, canonical caseless matching (matches APFS), own fold function with a Cherokee fix, `name_scheme` (ADR-0017); §9 `nodes` columns, §10 commit fields, §11 Names.
 - **0.9** (2026-11-24): Spike 07 decided. Direct presigned chunk transfer with signed SHA-256 and length, 15-minute URLs, HEAD on commit, no bucket notifications, Garage pinned at v2.5.0 (ADR-0015); upload reservation rows, weekly orphan sweep, idempotent commits via `commit_id` (ADR-0016); architecture sketch drops the event queue; §9–§12 updated.
 - **0.8** (2026-11-23): Spike 06 decided. Local change detection with OS events as hints and scans as the truth, `rjeczalik/notify` watcher, safe apply of remote changes, NFC names, v1 skip and ignore rules (ADR-0014); §10 gains apply and detection subsections.
